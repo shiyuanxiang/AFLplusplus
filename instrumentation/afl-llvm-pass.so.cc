@@ -27,13 +27,15 @@
  */
 
 #define AFL_LLVM_PASS
-
+#include <cstdlib>
+#include <cmath>
+#include <ctime>
 #include "config.h"
 #include "debug.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-
+#include <cstring>
 #include <list>
 #include <string>
 #include <fstream>
@@ -45,7 +47,7 @@ typedef long double max_align_t;
 #endif
 
 #include "llvm/Pass.h"
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
+#if LLVM_VERSION_MAJOR >= 11 /* use new pass manager */
   #include "llvm/Passes/PassPlugin.h"
   #include "llvm/Passes/PassBuilder.h"
   #include "llvm/IR/PassManager.h"
@@ -57,7 +59,7 @@ typedef long double max_align_t;
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
-#if LLVM_VERSION_MAJOR >= 14                /* how about stable interfaces? */
+#if LLVM_VERSION_MAJOR >= 14 /* how about stable interfaces? */
   #include "llvm/Passes/OptimizationLevel.h"
 #endif
 
@@ -79,15 +81,12 @@ using namespace llvm;
 
 namespace {
 
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
+#if LLVM_VERSION_MAJOR >= 11 /* use new pass manager */
 class AFLCoverage : public PassInfoMixin<AFLCoverage> {
-
  public:
   AFLCoverage() {
-
 #else
 class AFLCoverage : public ModulePass {
-
  public:
   static char ID;
   AFLCoverage() : ModulePass(ID) {
@@ -95,10 +94,9 @@ class AFLCoverage : public ModulePass {
 #endif
 
     initInstrumentList();
-
   }
 
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
+#if LLVM_VERSION_MAJOR >= 11 /* use new pass manager */
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
 #else
   bool runOnModule(Module &M) override;
@@ -111,15 +109,13 @@ class AFLCoverage : public ModulePass {
   uint32_t    function_minimum_size = 1;
   const char *ctx_str = NULL, *caller_str = NULL, *skip_nozero = NULL;
   const char *use_threadsafe_counters = nullptr;
-
 };
 
 }  // namespace
 
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
+#if LLVM_VERSION_MAJOR >= 11 /* use new pass manager */
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
-
   return {LLVM_PLUGIN_API_VERSION, "AFLCoverage", "v0.1",
           /* lambda to insert our pass into the pass pipeline. */
           [](PassBuilder &PB) {
@@ -134,9 +130,7 @@ llvmGetPassPluginInfo() {
             PB.registerOptimizerLastEPCallback(
     #endif
                 [](ModulePassManager &MPM, OptimizationLevel OL) {
-
                   MPM.addPass(AFLCoverage());
-
                 });
 
   /* TODO LTO registration */
@@ -145,24 +139,17 @@ llvmGetPassPluginInfo() {
             PB.registerPipelineParsingCallback([](StringRef          Name,
                                                   ModulePassManager &MPM,
                                                   ArrayRef<PipelineElement>) {
-
               if (Name == "AFLCoverage") {
-
                 MPM.addPass(AFLCoverage());
                 return true;
 
               } else {
-
                 return false;
-
               }
-
             });
 
   #endif
-
           }};
-
 }
 
 #else
@@ -175,7 +162,6 @@ char AFLCoverage::ID = 0;
     (LLVM_VERSION_MINOR < 9 || \
      (LLVM_VERSION_MINOR == 9 && LLVM_VERSION_PATCH < 1))
 uint64_t PowerOf2Ceil(unsigned in) {
-
   uint64_t in64 = in - 1;
   in64 |= (in64 >> 1);
   in64 |= (in64 >> 2);
@@ -184,7 +170,6 @@ uint64_t PowerOf2Ceil(unsigned in) {
   in64 |= (in64 >> 16);
   in64 |= (in64 >> 32);
   return in64 + 1;
-
 }
 
 #endif
@@ -194,10 +179,72 @@ uint64_t PowerOf2Ceil(unsigned in) {
     (LLVM_VERSION_MAJOR == 4 && LLVM_VERSION_PATCH >= 1)
   #define AFL_HAVE_VECTOR_INTRINSICS 1
 #endif
+// [syx] variable
+static int pthread_op_id = 61439;
+//[syx] function
+static Function *declarePthreadSetschedparam(Module &M) {
+  LLVMContext        &Ctx = M.getContext();
+  std::vector<Type *> paramTypes = {Type::getInt64Ty(Ctx),
+                                    Type::getInt32Ty(Ctx),
+                                    PointerType::get(Type::getInt32Ty(Ctx), 0)};
+  FunctionType       *FuncType =
+      FunctionType::get(Type::getInt32Ty(Ctx), paramTypes, false);
+  Function *Func = Function::Create(FuncType, Function::ExternalLinkage,
+                                    "pthread_setschedparam", M);
+  Func->setCallingConv(CallingConv::C);
+  return Func;
+}
+static Function *declarePthreadSelf(Module &M) {
+  LLVMContext &Ctx = M.getContext();
+  auto        *FuncType = FunctionType::get(Type::getInt64Ty(Ctx), false);
+  Function    *Func =
+      Function::Create(FuncType, Function::ExternalLinkage, "pthread_self", M);
+  Func->setCallingConv(CallingConv::C);
+  return Func;
+}
 
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
+// [syx] coverage-oriented instrument
+static int hasTIS(Function &F) {
+  int if_hasTIS = 0;
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      if (auto *call = dyn_cast<CallInst>(&I)) {
+        if (Function *calledFunction = call->getCalledFunction()) {
+          StringRef functionName = calledFunction->getName();
+          if (functionName.contains("pthread")) {
+            if_hasTIS = 1;
+            break;
+          }
+        }
+      }
+    }
+  }
+  return if_hasTIS;
+}
+
+static int generateNormalDistributedInt() {
+  static bool seeded = false;
+  if (!seeded) {
+    srand(time(nullptr));
+    seeded = true;
+  }
+
+  // Box-Muller transform to generate a normal distributed value
+  double u1 = rand() / (RAND_MAX + 1.0);
+  double u2 = rand() / (RAND_MAX + 1.0);
+  double z0 = sqrt(-2.0 * log(u1)) * cos(2 * M_PI * u2);
+  double mean = 49.5;
+  double stddev = 15;
+  int    result = static_cast<int>(std::round(mean + z0 * stddev));
+
+  // Clamp the results to [0, 99]
+  if (result < 0) return 0;
+  if (result > 99) return 99;
+  return result;
+}
+
+#if LLVM_VERSION_MAJOR >= 11 /* use new pass manager */
 PreservedAnalyses AFLCoverage::run(Module &M, ModuleAnalysisManager &MAM) {
-
 #else
 bool AFLCoverage::runOnModule(Module &M) {
 
@@ -206,7 +253,9 @@ bool AFLCoverage::runOnModule(Module &M) {
   LLVMContext &C = M.getContext();
 
   IntegerType *Int8Ty = IntegerType::getInt8Ty(C);
+  IntegerType *Int16Ty = IntegerType::getInt16Ty(C);
   IntegerType *Int32Ty = IntegerType::getInt32Ty(C);
+  IntegerType *Int64Ty = IntegerType::getInt64Ty(C);
 #ifdef AFL_HAVE_VECTOR_INTRINSICS
   IntegerType *IntLocTy =
       IntegerType::getIntNTy(C, sizeof(PREV_LOC_T) * CHAR_BIT);
@@ -228,7 +277,6 @@ bool AFLCoverage::runOnModule(Module &M) {
   if (getenv("AFL_DEBUG")) debug = 1;
 
   if ((isatty(2) && !getenv("AFL_QUIET")) || getenv("AFL_DEBUG") != NULL) {
-
     SAYF(cCYA "afl-llvm-pass" VERSION cRST
               " by <lszekeres@google.com> and <adrian.herrera@anu.edu.au>\n");
 
@@ -255,11 +303,9 @@ bool AFLCoverage::runOnModule(Module &M) {
   unsigned int inst_ratio = 100;
 
   if (inst_ratio_str) {
-
     if (sscanf(inst_ratio_str, "%u", &inst_ratio) != 1 || !inst_ratio ||
         inst_ratio > 100)
       FATAL("Bad value of AFL_INST_RATIO (must be between 1 and 100)");
-
   }
 
 #if LLVM_VERSION_MAJOR < 9
@@ -269,9 +315,7 @@ bool AFLCoverage::runOnModule(Module &M) {
   use_threadsafe_counters = getenv("AFL_LLVM_THREADSAFE_INST");
 
   if ((isatty(2) && !getenv("AFL_QUIET")) || !!getenv("AFL_DEBUG")) {
-
     if (use_threadsafe_counters) {
-
       // disabled unless there is support for other modules as well
       // (increases documentation complexity)
       /*      if (!getenv("AFL_LLVM_NOT_ZERO")) { */
@@ -291,12 +335,9 @@ bool AFLCoverage::runOnModule(Module &M) {
       */
 
     } else {
-
       SAYF(cCYA "afl-llvm-pass" VERSION cRST
                 " using non-thread safe instrumentation\n");
-
     }
-
   }
 
   unsigned PrevLocSize = 0;
@@ -319,7 +360,8 @@ bool AFLCoverage::runOnModule(Module &M) {
     if (sscanf(ngram_size_str, "%u", &ngram_size) != 1 || ngram_size < 2 ||
         ngram_size > NGRAM_SIZE_MAX)
       FATAL(
-          "Bad value of AFL_NGRAM_SIZE (must be between 2 and NGRAM_SIZE_MAX "
+          "Bad value of AFL_NGRAM_SIZE (must be between 2 and "
+          "NGRAM_SIZE_MAX "
           "(%u))",
           NGRAM_SIZE_MAX);
 
@@ -338,18 +380,14 @@ bool AFLCoverage::runOnModule(Module &M) {
             CTX_MAX_K);
 
   if (ctx_k == 1) {
-
     ctx_k = 0;
     instrument_ctx = true;
     caller_str = ctx_k_str;  // Enable CALLER instead
-
   }
 
   if (ctx_k) {
-
     PrevCallerSize = ctx_k;
     instrument_ctx = true;
-
   }
 
 #else
@@ -472,9 +510,10 @@ bool AFLCoverage::runOnModule(Module &M) {
 #endif
 
 #ifdef AFL_HAVE_VECTOR_INTRINSICS
-  /* Create the vector shuffle mask for updating the previous block history.
-     Note that the first element of the vector will store cur_loc, so just set
-     it to undef to allow the optimizer to do its thing. */
+  /* Create the vector shuffle mask for updating the previous block
+     history. Note that the first element of the vector will store
+     cur_loc, so just set it to undef to allow the optimizer to do its
+     thing. */
 
   SmallVector<Constant *, 32> PrevLocShuffle = {UndefValue::get(Int32Ty)};
 
@@ -490,7 +529,6 @@ bool AFLCoverage::runOnModule(Module &M) {
   SmallVector<Constant *, 32> PrevCallerShuffle = {UndefValue::get(Int32Ty)};
 
   if (ctx_k) {
-
     for (unsigned I = 0; I < PrevCallerSize - 1; ++I)
       PrevCallerShuffle.push_back(ConstantInt::get(Int32Ty, I));
 
@@ -498,7 +536,6 @@ bool AFLCoverage::runOnModule(Module &M) {
       PrevCallerShuffle.push_back(ConstantInt::get(Int32Ty, PrevCallerSize));
 
     PrevCallerShuffleMask = ConstantVector::get(PrevCallerShuffle);
-
   }
 
 #endif
@@ -513,9 +550,17 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   int inst_blocks = 0;
   scanForDangerousFunctions(&M);
+  //[syx]
+  Function *pthreadSelf = declarePthreadSelf(M);
+  Function *pthreadSetschedparam = declarePthreadSetschedparam(M);
 
   for (auto &F : M) {
-
+    //[syx]
+    if (hasTIS(F) == 0) {
+      double randomValue = static_cast<double>(rand()) / RAND_MAX;
+      if (randomValue > 0.5) { continue; }
+    }
+    errs() << "instrumenting function: " << F.getName() << "\n";
     int has_calls = 0;
     if (debug)
       fprintf(stderr, "FUNCTION: %s (%zu)\n", F.getName().str().c_str(),
@@ -525,18 +570,14 @@ bool AFLCoverage::runOnModule(Module &M) {
 
     if (F.size() < function_minimum_size) { continue; }
 
-    std::list<Value *> todo;
     for (auto &BB : F) {
-
       BasicBlock::iterator IP = BB.getFirstInsertionPt();
       IRBuilder<>          IRB(&(*IP));
 
       // Context sensitive coverage
       if (instrument_ctx && &BB == &F.getEntryBlock()) {
-
 #ifdef AFL_HAVE_VECTOR_INTRINSICS
         if (ctx_k) {
-
           PrevCaller = IRB.CreateLoad(
   #if LLVM_VERSION_MAJOR >= 14
               PrevCallerTy,
@@ -548,7 +589,6 @@ bool AFLCoverage::runOnModule(Module &M) {
               IRB.CreateZExt(IRB.CreateXorReduce(PrevCaller), IRB.getInt32Ty());
 
         } else
-
 #endif
         {
 
@@ -562,42 +602,32 @@ bool AFLCoverage::runOnModule(Module &M) {
           PrevCtxLoad->setMetadata(M.getMDKindID("nosanitize"),
                                    MDNode::get(C, None));
           PrevCtx = PrevCtxLoad;
-
         }
 
-        // does the function have calls? and is any of the calls larger than one
-        // basic block?
+        // does the function have calls? and is any of the calls larger
+        // than one basic block?f
         for (auto &BB_2 : F) {
-
           if (has_calls) break;
           for (auto &IN : BB_2) {
-
             CallInst *callInst = nullptr;
             if ((callInst = dyn_cast<CallInst>(&IN))) {
-
               Function *Callee = callInst->getCalledFunction();
               if (!Callee || Callee->size() < function_minimum_size)
                 continue;
               else {
-
                 has_calls = 1;
                 break;
-
               }
-
             }
-
           }
-
         }
 
-        // if yes we store a context ID for this function in the global var
+        // if yes we store a context ID for this function in the global
+        // var
         if (has_calls) {
-
           Value *NewCtx = ConstantInt::get(Int32Ty, AFL_R(map_size));
 #ifdef AFL_HAVE_VECTOR_INTRINSICS
           if (ctx_k) {
-
             Value *ShuffledPrevCaller = IRB.CreateShuffleVector(
                 PrevCaller, UndefValue::get(PrevCallerTy),
                 PrevCallerShuffleMask);
@@ -610,7 +640,6 @@ bool AFLCoverage::runOnModule(Module &M) {
                                MDNode::get(C, None));
 
           } else
-
 #endif
           {
 
@@ -618,11 +647,8 @@ bool AFLCoverage::runOnModule(Module &M) {
             StoreInst *StoreCtx = IRB.CreateStore(NewCtx, AFLContext);
             StoreCtx->setMetadata(M.getMDKindID("nosanitize"),
                                   MDNode::get(C, None));
-
           }
-
         }
-
       }
 
       if (AFL_R(100) >= inst_ratio) continue;
@@ -631,21 +657,113 @@ bool AFLCoverage::runOnModule(Module &M) {
 
       // cur_loc++;
       cur_loc = AFL_R(map_size);
+      int activate = 1;
+      // [syx]thread context instrument
+      if (activate == 1) {
+        int if_interleaving = 0;
+        for (auto &I : BB) {
+          if (auto *call = dyn_cast<CallInst>(&I)) {
+            if (Function *calledFunction = call->getCalledFunction()) {
+              StringRef functionName = calledFunction->getName();
+              if (functionName.contains("pthread_mutex_lock") ||
+                  functionName.contains("pthread_mutex_unlock") ||
+                  functionName.contains("pthread_join")) {
+                // get instr point
+                IRBuilder<> Builder(&I);
+                Builder.SetInsertPoint(&BB, ++Builder.GetInsertPoint());
+
+                CallInst *ThreadIdCall = Builder.CreateCall(pthreadSelf);
+                Value    *ThreadIdValue = ThreadIdCall;
+                Function *printFunc = M.getFunction("printf");
+                if (!printFunc) {
+                  LLVMContext  &Ctx = M.getContext();
+                  PointerType  *Pty = Type::getInt8PtrTy(Ctx);
+                  FunctionType *FuncType = FunctionType::get(
+                      IntegerType::getInt32Ty(Ctx), {Pty}, true);
+                  printFunc = Function::Create(
+                      FuncType, Function::ExternalLinkage, "printf", M);
+                  printFunc->setCallingConv(CallingConv::C);
+                }
+                // create a format string for printf.
+                Constant *formatStr =
+                    Builder.CreateGlobalStringPtr("[syx]tid: %lu\n");
+                // call printf to log the thread ID.
+                Builder.CreateCall(printFunc, {formatStr, ThreadIdValue});
+                // let ThreadIdValue mod 20
+                ConstantInt *OneH = ConstantInt::get(Int8Ty, 100);
+                Value       *ThreadIdMod =
+                    Builder.CreateURem(IRB.CreateZExt(ThreadIdValue, Int64Ty),
+                                       IRB.CreateZExt(OneH, Int64Ty), "modulo");
+                Value *PthreadOpId = ConstantInt::get(Int8Ty, pthread_op_id);
+                formatStr =
+                    Builder.CreateGlobalStringPtr("[syx]tid(moded): %lu\n");
+                Builder.CreateCall(printFunc, {formatStr, ThreadIdMod});
+                Value *ThreadIdAdd =
+                    Builder.CreateAdd(ThreadIdMod, PthreadOpId);
+                // let TOPLoc = shm+65535-4096+ThreadIdAdd
+                // suppose we only have most 20 threads and 200 ops
+                LoadInst *MapPtr =
+                    Builder.CreateLoad(PointerType::get(Int8Ty, 0), AFLMapPtr);
+                Value *MapPtrIdx = Builder.CreateGEP(
+                    Int8Ty, MapPtr, IRB.CreateZExt(ThreadIdAdd, Int32Ty));
+
+                ConstantInt *One = ConstantInt::get(Int8Ty, 1);
+                Value       *MapPtrVal = Builder.CreateLoad(Int8Ty, MapPtrIdx);
+                Value       *MapPtrValAdd = Builder.CreateAdd(MapPtrVal, One);
+
+                Builder.CreateStore(MapPtrValAdd, MapPtrIdx);
+                // update op_id
+                pthread_op_id += 100;
+                errs() << "pthread_op_id: " << pthread_op_id << "\n";
+                if (pthread_op_id > 65435) { pthread_op_id = 61439; }
+              }
+
+              if (functionName.contains("pthread")) { if_interleaving = 1; }
+            }
+          }
+        }
+
+        // [syx]Schedule-intervention Instrumentation
+        // if_interleaving = 0;
+        if (if_interleaving == 1) {
+          LLVMContext &Ctx = M.getContext();
+          IRBuilder<>  Builder(Ctx);
+          Builder.SetInsertPoint(&BB, BB.getFirstInsertionPt());
+          Function *printFunc = M.getFunction("printf");
+          Constant *formatStr = Builder.CreateGlobalStringPtr(
+              "[syx]set thread priority in func: %s\n");
+          Constant *funcNameStr =
+              Builder.CreateGlobalStringPtr(F.getName().str());
+          // Builder.CreateCall(printFunc, {formatStr, funcNameStr});
+
+          CallInst *threadId = Builder.CreateCall(pthreadSelf, {}, "threadId");
+          ConstantInt *policy =
+              ConstantInt::get(Type::getInt32Ty(Ctx), SCHED_OTHER);
+          AllocaInst *paramAlloca = Builder.CreateAlloca(Builder.getInt32Ty());
+
+          int priority = generateNormalDistributedInt();
+          Builder.CreateStore(Builder.getInt32(priority), paramAlloca);
+
+          // Create the call to pthread_setschedparam
+          std::vector<Value *> args = {threadId, policy, paramAlloca};
+          CallInst            *setSchedResult =
+              Builder.CreateCall(pthreadSetschedparam, args, "setSchedResult");
+        }
+      }
 
 /* There is a problem with Ubuntu 18.04 and llvm 6.0 (see issue #63).
    The inline function successors() is not inlined and also not found at runtime
    :-( As I am unable to detect Ubuntu18.04 here, the next best thing is to
    disable this optional optimization for LLVM 6.0.0 and Linux */
 #if !(LLVM_VERSION_MAJOR == 6 && LLVM_VERSION_MINOR == 0) || !defined __linux__
-      // only instrument if this basic block is the destination of a previous
-      // basic block that has multiple successors
-      // this gets rid of ~5-10% of instrumentations that are unnecessary
-      // result: a little more speed and less map pollution
+      // only instrument if this basic block is the destination of a
+      // previous basic block that has multiple successors this gets rid
+      // of ~5-10% of instrumentations that are unnecessary result: a
+      // little more speed and less map pollution
       int more_than_one = -1;
       // fprintf(stderr, "BB %u: ", cur_loc);
       for (pred_iterator PI = pred_begin(&BB), E = pred_end(&BB); PI != E;
            ++PI) {
-
         BasicBlock *Pred = *PI;
 
         int count = 0;
@@ -654,30 +772,25 @@ bool AFLCoverage::runOnModule(Module &M) {
 
         for (succ_iterator SI = succ_begin(Pred), E = succ_end(Pred); SI != E;
              ++SI) {
-
           BasicBlock *Succ = *SI;
 
           // if (count > 0)
           //  fprintf(stderr, "|");
           if (Succ != NULL) count++;
           // fprintf(stderr, "%p", Succ);
-
         }
 
         if (count > 1) more_than_one = 1;
-
       }
 
       // fprintf(stderr, " == %d\n", more_than_one);
       if (F.size() > 1 && more_than_one != 1) {
-
-        // in CTX mode we have to restore the original context for the caller -
-        // she might be calling other functions which need the correct CTX
+        // in CTX mode we have to restore the original context for the
+        // caller - she might be calling other functions which need the
+        // correct CTX
         if (instrument_ctx && has_calls) {
-
           Instruction *Inst = BB.getTerminator();
           if (isa<ReturnInst>(Inst) || isa<ResumeInst>(Inst)) {
-
             IRBuilder<> Post_IRB(Inst);
 
             StoreInst *RestoreCtx;
@@ -689,13 +802,10 @@ bool AFLCoverage::runOnModule(Module &M) {
               RestoreCtx = Post_IRB.CreateStore(PrevCtx, AFLContext);
             RestoreCtx->setMetadata(M.getMDKindID("nosanitize"),
                                     MDNode::get(C, None));
-
           }
-
         }
 
         continue;
-
       }
 
 #endif
@@ -714,7 +824,6 @@ bool AFLCoverage::runOnModule(Module &M) {
       LoadInst *PrevLoc;
 
       if (ngram_size) {
-
         PrevLoc = IRB.CreateLoad(
 #if LLVM_VERSION_MAJOR >= 14
             PrevLocTy,
@@ -722,13 +831,11 @@ bool AFLCoverage::runOnModule(Module &M) {
             AFLPrevLoc);
 
       } else {
-
         PrevLoc = IRB.CreateLoad(
 #if LLVM_VERSION_MAJOR >= 14
             IRB.getInt32Ty(),
 #endif
             AFLPrevLoc);
-
       }
 
       PrevLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
@@ -736,8 +843,9 @@ bool AFLCoverage::runOnModule(Module &M) {
 
 #ifdef AFL_HAVE_VECTOR_INTRINSICS
       /* "For efficiency, we propose to hash the tuple as a key into the
-         hit_count map as (prev_block_trans << 1) ^ curr_block_trans, where
-         prev_block_trans = (block_trans_1 ^ ... ^ block_trans_(n-1)" */
+         hit_count map as (prev_block_trans << 1) ^ curr_block_trans,
+         where prev_block_trans = (block_trans_1 ^ ... ^
+         block_trans_(n-1)" */
 
       if (ngram_size)
         PrevLocTrans =
@@ -769,17 +877,36 @@ bool AFLCoverage::runOnModule(Module &M) {
             IRB.CreateZExt(
                 IRB.CreateXor(PrevLocTrans, IRB.CreateZExt(CurLoc, Int32Ty)),
                 Int32Ty));
-      else
+      else {}
+
 #endif
+
+      if (true) {
+        // [syx]
+        Value *Xor = IRB.CreateXor(PrevLocTrans, CurLoc);
+        // let xor mod 65535-4096
+        Value    *Mod = ConstantInt::get(Int32Ty, 61439);
+        Value    *xorMod = IRB.CreateURem(Xor, Mod);
+        Function *printFunc = M.getFunction("printf");
+        Constant *formatStr = IRB.CreateGlobalStringPtr("[syx]edge id: %lu\n");
+        errs() << "instrumenting edge id: " << cur_loc << "\n";
+        // IRB.CreateCall(printFunc, {formatStr, xorMod});
+        MapPtrIdx = IRB.CreateGEP(
+#if LLVM_VERSION_MAJOR >= 14
+            Int8Ty,
+#endif
+            MapPtr, xorMod);
+      } else {
         MapPtrIdx = IRB.CreateGEP(
 #if LLVM_VERSION_MAJOR >= 14
             Int8Ty,
 #endif
             MapPtr, IRB.CreateXor(PrevLocTrans, CurLoc));
+      }
 
       /* Update bitmap */
 
-      if (use_threadsafe_counters) {                              /* Atomic */
+      if (use_threadsafe_counters) { /* Atomic */
 
         IRB.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::Add, MapPtrIdx, One,
 #if LLVM_VERSION_MAJOR >= 13
@@ -793,7 +920,6 @@ bool AFLCoverage::runOnModule(Module &M) {
         */
 
       } else {
-
         LoadInst *Counter = IRB.CreateLoad(
 #if LLVM_VERSION_MAJOR >= 14
             IRB.getInt8Ty(),
@@ -805,13 +931,13 @@ bool AFLCoverage::runOnModule(Module &M) {
 
 #if LLVM_VERSION_MAJOR >= 9
         if (!skip_nozero) {
-
 #else
         if (neverZero_counters_str != NULL) {
 
 #endif
           /* hexcoder: Realize a counter that skips zero during overflow.
-           * Once this counter reaches its maximum value, it next increments to
+           * Once this counter reaches its maximum value, it next
+           * increments to
            * 1
            *
            * Instead of
@@ -825,22 +951,20 @@ bool AFLCoverage::runOnModule(Module &M) {
           auto         cf = IRB.CreateICmpEQ(Incr, Zero);
           auto         carry = IRB.CreateZExt(cf, Int8Ty);
           Incr = IRB.CreateAdd(Incr, carry);
-
         }
 
         IRB.CreateStore(Incr, MapPtrIdx)
             ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
-      }                                                  /* non atomic case */
+      } /* non atomic case */
 
-      /* Update prev_loc history vector (by placing cur_loc at the head of the
-         vector and shuffle the other elements back by one) */
+      /* Update prev_loc history vector (by placing cur_loc at the head of
+         the vector and shuffle the other elements back by one) */
 
       StoreInst *Store;
 
 #ifdef AFL_HAVE_VECTOR_INTRINSICS
       if (ngram_size) {
-
         Value *ShuffledPrevLoc = IRB.CreateShuffleVector(
             PrevLoc, UndefValue::get(PrevLocTy), PrevLocShuffleMask);
         Value *UpdatedPrevLoc = IRB.CreateInsertElement(
@@ -850,24 +974,21 @@ bool AFLCoverage::runOnModule(Module &M) {
         Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
       } else
-
 #endif
       {
 
         Store = IRB.CreateStore(ConstantInt::get(Int32Ty, cur_loc >> 1),
                                 AFLPrevLoc);
         Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
-
       }
 
-      // in CTX mode we have to restore the original context for the caller -
-      // she might be calling other functions which need the correct CTX.
-      // Currently this is only needed for the Ubuntu clang-6.0 bug
+      // in CTX mode we have to restore the original context for the
+      // caller - she might be calling other functions which need the
+      // correct CTX. Currently this is only needed for the Ubuntu
+      // clang-6.0 bug
       if (instrument_ctx && has_calls) {
-
         Instruction *Inst = BB.getTerminator();
         if (isa<ReturnInst>(Inst) || isa<ResumeInst>(Inst)) {
-
           IRBuilder<> Post_IRB(Inst);
 
           StoreInst *RestoreCtx;
@@ -879,13 +1000,10 @@ bool AFLCoverage::runOnModule(Module &M) {
             RestoreCtx = Post_IRB.CreateStore(PrevCtx, AFLContext);
           RestoreCtx->setMetadata(M.getMDKindID("nosanitize"),
                                   MDNode::get(C, None));
-
         }
-
       }
 
       inst_blocks++;
-
     }
 
 #if 0
@@ -1005,11 +1123,11 @@ bool AFLCoverage::runOnModule(Module &M) {
     }
 
 #endif
-
   }
 
   /*
-    // This is currently disabled because we not only need to create/insert a
+    // This is currently disabled because we not only need to
+    create/insert a
     // function (easy), but also add it as a constructor with an ID < 5
 
     if (getenv("AFL_LLVM_DONTWRITEID") == NULL) {
@@ -1022,8 +1140,8 @@ bool AFLCoverage::runOnModule(Module &M) {
       if (!f) {
 
         fprintf(stderr,
-                "Error: init function could not be created (this should not
-    happen)\n"); exit(-1);
+                "Error: init function could not be created (this should
+    not happen)\n"); exit(-1);
 
       }
 
@@ -1033,8 +1151,8 @@ bool AFLCoverage::runOnModule(Module &M) {
       if (!bb) {
 
         fprintf(stderr,
-                "Error: init function does not have an EntryBlock (this should
-    not happen)\n"); exit(-1);
+                "Error: init function does not have an EntryBlock (this
+    should not happen)\n"); exit(-1);
 
       }
 
@@ -1047,8 +1165,8 @@ bool AFLCoverage::runOnModule(Module &M) {
             M, Int32Ty, true, GlobalValue::ExternalLinkage, 0,
             "__afl_final_loc");
         ConstantInt *const_loc = ConstantInt::get(Int32Ty, map_size);
-        StoreInst *  StoreFinalLoc = IRB.CreateStore(const_loc, AFLFinalLoc);
-        StoreFinalLoc->setMetadata(M.getMDKindID("nosanitize"),
+        StoreInst *  StoreFinalLoc = IRB.CreateStore(const_loc,
+    AFLFinalLoc); StoreFinalLoc->setMetadata(M.getMDKindID("nosanitize"),
                                      MDNode::get(C, None));
 
       }
@@ -1060,11 +1178,9 @@ bool AFLCoverage::runOnModule(Module &M) {
   /* Say something nice. */
 
   if (!be_quiet) {
-
     if (!inst_blocks)
       WARNF("No instrumentation targets found.");
     else {
-
       char modeline[100];
       snprintf(modeline, sizeof(modeline), "%s%s%s%s%s%s",
                getenv("AFL_HARDEN") ? "hardened" : "non-hardened",
@@ -1075,25 +1191,20 @@ bool AFLCoverage::runOnModule(Module &M) {
                getenv("AFL_USE_UBSAN") ? ", UBSAN" : "");
       OKF("Instrumented %d locations (%s mode, ratio %u%%).", inst_blocks,
           modeline, inst_ratio);
-
     }
-
   }
 
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
+#if LLVM_VERSION_MAJOR >= 11 /* use new pass manager */
   return PreservedAnalyses();
 #else
   return true;
 #endif
-
 }
 
-#if LLVM_VERSION_MAJOR < 11                         /* use old pass manager */
+#if LLVM_VERSION_MAJOR < 11 /* use old pass manager */
 static void registerAFLPass(const PassManagerBuilder &,
                             legacy::PassManagerBase &PM) {
-
   PM.add(new AFLCoverage());
-
 }
 
 static RegisterStandardPasses RegisterAFLPass(
@@ -1102,4 +1213,3 @@ static RegisterStandardPasses RegisterAFLPass(
 static RegisterStandardPasses RegisterAFLPass0(
     PassManagerBuilder::EP_EnabledOnOptLevel0, registerAFLPass);
 #endif
-
